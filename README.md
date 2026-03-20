@@ -232,7 +232,7 @@ A lightweight data preview - a subset of validation statistics are computed and 
 **The image displayed during cropping is the mean pixel brightness across all frames.** This is the most stable reference image for judging where your neurons are and how to position the crop.
 
 **Parameters:**
-- **Critical for performance**: Get the crop as small as possible while keeping all your neurons inside it. Every pixel outside the crop is pure computation saved.
+- **Critical for performance**: Get the crop as small as possible while keeping all your neurons inside it. Every pixel outside the crop is pure computation saved. However, leave at least 1.5× your expected cell diameter of space between the outermost neurons and the crop edges - neurons too close to the boundary are difficult for the watershed algorithm (Step 4) to correctly segment because it lacks surrounding context to distinguish them from the edge.
 - Use a rectangle crop centred on your imaging field
 - Adjust the offset if your field of view is not centred in the frame
 - **Tip**: Test on 10% of video or less during setup, then re-run the full pipeline once you have a crop size you are happy with
@@ -295,7 +295,9 @@ Think of NNDSVD like a conductor listening to a recording of an orchestra warmin
 - **Spatial regularization**: Encourages components to be "blob-like" rather than scattered pixels. Increase for larger, more spread-out neurons; decrease for very small, compact ones.
 - **Chunk size**: Decrease for lower memory usage at the cost of slower processing.
 
-> **Important context:** The goal of NNDSVD is not perfection - it is a fast, good-enough initialization for CNMF so the algorithm does not have to search from scratch. Spending significant time tuning NNDSVD parameters provides diminishing returns. If your final CNMF results look reasonable, your initialization was good enough.
+> **Tip:** Always overshoot the number of components relative to what you expect for your lens and brain region. If you think you have ~30 neurons, initialize with 35–40 components. Extra components are cheap - CNMF will prune spurious ones downstream - but under-initializing means neurons that were never seeded cannot be recovered later. When in doubt, err on the side of more.
+
+> **Important context:** The goal of NNDSVD is not perfection
 
 ---
 
