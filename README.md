@@ -46,6 +46,7 @@ This guide walks through the complete miniscope calcium imaging processing pipel
     - [Step 4e: AC Initialization](#step-4e-ac-initialization)
     - [Step 4f: Final Component Preparation](#step-4f-final-component-preparation)
     - [Step 4g: Temporal Merging](#step-4g-temporal-merging)
+    - [Step 4h: Artifact Rejection](#step-4h-artifact-rejection)
   - [Step 5: CNMF Preparation](#step-5-cnmf-preparation)
     - [Step 5a: Noise Estimation](#step-5a-noise-estimation)
     - [Step 5b: Validation and Setup](#step-5b-validation-and-setup)
@@ -72,6 +73,7 @@ This guide walks through the complete miniscope calcium imaging processing pipel
 - [Interpreting Your Results](#interpreting-your-results)
 - [Advanced Features](#advanced-features)
 - [Automation Features](#automation-features)
+- [Command-Line and Batch Processing](#command-line-and-batch-processing)
 - [System Requirements](#system-requirements)
 
 ---
@@ -234,10 +236,13 @@ A lightweight data preview - a subset of validation statistics are computed and 
 **Parameters:**
 - **Critical for performance**: Get the crop as small as possible while keeping all your neurons inside it. Every pixel outside the crop is pure computation saved. However, leave at least 1.5× your expected cell diameter of space between the outermost neurons and the crop edges - neurons too close to the boundary are difficult for the watershed algorithm (Step 4) to correctly segment because it lacks surrounding context to distinguish them from the edge.
 - Use a rectangle crop centred on your imaging field
+- **Crop shape**: A rectangular crop is the default. An optional circular mask is also available - it keeps the inscribed circle of the crop and zeroes everything outside it, which is useful when a GRIN lens gives you a round field of view with dark corners
 - Adjust the offset if your field of view is not centred in the frame
 - **Tip**: Test on 10% of video or less during setup, then re-run the full pipeline once you have a crop size you are happy with
 
 > If you need a static 2D image of the cropped field of view for presentations or quick checks, you can export one from the Zarr output using a short Python snippet - load the array and save the mean frame as a JPEG.
+
+> **Optional: CNMF-E-style background removal.** Step 3a includes an optional background-removal stage that suppresses large, diffuse background before source extraction. Leave it on `none` (unchanged) for most recordings. `lowrank` removes the top background modes; `ring` applies a CNMF-E annulus - set the ring radius to at least one cell radius so the removed modes stay background-like and real neurons survive. This is most useful in preparations with strong, slowly varying background.
 
 ---
 
@@ -297,7 +302,7 @@ Think of NNDSVD like a conductor listening to a recording of an orchestra warmin
 
 > **Tip:** Always overshoot the number of components relative to what you expect for your lens and brain region. If you think you have ~30 neurons, initialize with 35–40 components. Extra components are cheap - CNMF will prune spurious ones downstream - but under-initializing means neurons that were never seeded cannot be recovered later. When in doubt, err on the side of more.
 
-> **Important context:** The goal of NNDSVD is not perfection
+> **Important context:** The goal of NNDSVD is not perfection - it is to give CNMF a sensible starting point. A rough decomposition that captures the major sources is enough; the downstream CNMF steps refine the spatial footprints and temporal traces from there. Do not spend time chasing a flawless initialization.
 
 ---
 
@@ -377,6 +382,8 @@ Watershed segmentation determines how many candidate neurons are detected. Since
 
 > **No parameter deep dive for this step.** This is a quality-control checkpoint that removes obviously broken components before the expensive CNMF processing begins - NaN components, empty components, and flat (dead pixel) components are all filtered here. The defaults (remove all three types) should always remain enabled. The seeming redundancy of Steps 4e and 4f is intentional: the initialization chain from NNDSVD through temporal signal extraction to CNMF is important enough that multiple validation checkpoints are warranted rather than risking a silent upstream failure propagating through all of CNMF.
 
+The three filters - **Remove Components with NaN Values**, **Remove Empty Spatial Components**, and **Remove Flat Temporal Components** - are all enabled by default. The cleaned spatial and temporal matrices this step produces (the "clean" set) are what Steps 4g and 4h operate on.
+
 ---
 
 #### Step 4g: Temporal Merging
@@ -407,6 +414,31 @@ Watershed segmentation determines how many candidate neurons are detected. Since
 **Parameters:**
 - **Temporal Correlation Threshold**: How similar calcium traces need to be to consider merging (0.75 = 75% correlated). Scale with recording length using the figure above as a guide.
 - **Spatial Overlap Threshold**: How much the two components must overlap spatially (0.3 = 30% minimum overlap). Prevents merging neurons that happen to fire together but occupy different spatial locations.
+- **Maximum Component Size**: Caps the size (in pixels) of a merged component (5000 default). Prevents an aggressive merge from fusing many fragments into one oversized blob.
+- **Input Selection**: Uses the cleaned components from Step 4f (the "clean" set). This is the only input option and does not normally need changing.
+- **Maximum Number of Components** (Advanced): 0 = no limit. Cap the number of components processed during a quick test run; leave at 0 for full runs.
+
+---
+
+#### Step 4h: Artifact Rejection
+
+> **Optional step.** Step 4h sits between Step 4g and Step 5. It is most useful for brain regions with strong autofluorescence (for example striatum), where large, lipofuscin-rich or vascular structures can otherwise be mistaken for neurons. If your preparation is clean you can skip it.
+
+Step 4h flags large, **non-neural** components - autofluorescence, lipofuscin, and blood vessels - and moves them to a **quarantine** set. Crucially, quarantined components are **not deleted**: the kept (neural) components flow downstream into CNMF, while the quarantined ones are saved separately so you can always inspect them or subtract them later.
+
+**How it decides what is non-neural:** Real GCaMP neurons have sparse, right-skewed traces (fast rise, slow decay) and compact footprints. Autofluorescence and vessels differ on both counts - their traces are flat or slowly drifting rather than bursty, and their footprints are large, diffuse, or elongated. No single feature is decisive, so Step 4h combines several temporal and spatial measures and only quarantines a component when it is **large AND looks non-neural**. Small, genuine cells are never touched.
+
+**Parameters:**
+- **Max Cell Size (px)**: Only components at or above this size (1000 default) are eligible for quarantine. Anything smaller is treated as a real cell and kept regardless of the other measures.
+- **Min Trace Skewness**: Below this value (0.3 default) a trace looks flat or non-bursty rather than spiky. Genuine calcium traces are strongly right-skewed.
+- **Min Trace SNR**: Peak-over-noise using a robust (MAD) noise estimate. Below this (2.0 default) the signal is too weak to be a confident neuron.
+- **Max Drift Ratio**: Fraction of trace power in the slowest frequency band (0.6 default). Above this the trace is dominated by slow drift - the signature of bleaching autofluorescence rather than transient neural activity.
+- **Min Solidity**: Footprint area divided by its convex-hull area (0.4 default). Below this the footprint is diffuse or irregular rather than a compact blob.
+- **Only quarantine LARGE components (recommended)**: When enabled, the size gate above is required - a component must be large before any of the non-neural measures can quarantine it. This is the safest setting and protects small real cells.
+- **Min Flags (if not size-gated)**: If the size gate is turned off, a component must trip at least this many non-neural measures (2 default) before it is quarantined.
+- **Also save quarantine collapsed into ONE component**: In addition to saving each quarantined component individually, also save them collapsed into a single combined component - convenient for quickly visualising or subtracting the total artefact signal.
+
+**Outputs:** A kept set (the artifact-rejected components that continue into Step 5) and a separate quarantine set, both saved to the cache. Run it like any other step - from its panel in the GUI or with `python run_step.py 4h` - and use the QC viewer to plot either set (`4h` for the kept components, `4hq` for the quarantine); see [Command-Line and Batch Processing](#command-line-and-batch-processing).
 
 ---
 
@@ -442,9 +474,11 @@ The noise estimate (`sn` map) is foundational to everything CNMF does. CNMF mini
 Quality-control checkpoint before the expensive CNMF computation. Validates data integrity and optionally filters components by size.
 
 **Parameters:**
+- **Input Data**: Which component set to validate (`merged` by default - the components carried forward from the previous step).
 - **Check for NaN/Inf**: Always enable - NaN values will break CNMF silently. Can be slow on very large datasets but is worth the time.
 - **Compute Full Statistics**: Provides detailed component diagnostics useful for troubleshooting. Disable to save time if you are confident in your data.
-- **Size Filtering**:
+- **Apply size filtering**: Off by default - this step validates without removing anything. Enable it only if you want Step 5b to drop out-of-range components using the size bounds below.
+- **Size Filtering** (applied only when "Apply size filtering" is enabled):
   - Minimum size: 10 pixels is a reasonable floor
   - Maximum size: 1000 pixels - anything larger is likely a merged neuron, a large artefact, or a blood vessel
 
@@ -687,14 +721,17 @@ This step runs multi-penalty LASSO regression on local video regions to update e
 
 #### Step 7f: Merging and Validation
 
-Final spatial processing - merges the updated components from Step 7e, handles cluster-boundary overlaps, and produces the final spatial matrix ready for Step 8.
+Final spatial processing - merges the updated components from Step 7e, handles cluster-boundary overlaps, and produces the final spatial matrix ready for Step 8. In addition to the cluster-boundary cleanup, this step performs a final **duplicate merge**: two units are fused when they both overlap in space **and** are correlated in time. Because the spatial footprints are now at their most accurate, this is the right place to catch any remaining split components that earlier merges missed.
 
 **Parameters:**
-- **Apply smoothing**: Whether to apply Gaussian smoothing to merged components
+- **Apply smoothing**: Whether to apply Gaussian smoothing to merged components.
 - **Smoothing Sigma**: Gaussian filter sigma. Be cautious - over-smoothing causes footprints to bleed into large diffuse blobs that may overlap neighbouring neurons.
 - **Handle overlaps**: Normalizes components at cluster-boundary overlap regions. Keep this enabled in virtually all cases - disabling it produces inconsistent boundaries where processing windows meet.
-- **Min Component Size**: Minimum component size in pixels to keep after merging
-- **Save both versions**: Saves both raw and smoothed versions for comparison
+- **Min Component Size**: Minimum component size in pixels to keep after merging.
+- **Max Component Size**: Largest merged component to keep (5000 px default). A merged unit above this size is more likely a fused artefact than a single neuron.
+- **Merge Overlap Threshold**: Minimum spatial overlap (0-1, default 0.3) required to merge two units, measured as containment of the smaller footprint inside the larger (Szymkiewicz-Simpson). Lower values merge more aggressively.
+- **Merge Correlation Threshold**: Minimum temporal correlation (0-1, default 0.8) required to merge two units. A pair must clear *both* this and the overlap threshold to be fused, so spatially adjacent but independently firing neurons are left alone. Lower values merge more aggressively.
+- **Save both versions**: Saves both raw and smoothed versions for comparison.
 
 > **If components look blocky or rectangular after Step 7f:** This artefact comes from the bounding box geometry of Step 7c, not from smoothing. Reducing smoothing sigma will not fix it. If you see this, it is a cosmetic artefact of the tiling approach and does not affect trace quality. Step 7f is quick to re-run relative to 7e, so it is easy to experiment with smoothing settings.
 
@@ -934,6 +971,87 @@ For datasets with significant non-rigid motion, enable mesh-based correction in 
 - Load predefined parameters to ensure consistency across analyses
 - Parameters are automatically applied to each step during autorun
 - Auto-save feature preserves parameters after each step
+
+---
+
+## Command-Line and Batch Processing
+
+In addition to the GUI, MPS ships three command-line tools for running the pipeline without the interface - useful for re-running a single step with new parameters, for processing many sessions overnight, and for generating quality-control figures. They drive the **same step classes the GUI uses**, so the results are identical.
+
+### Re-running steps from the terminal (`run_step.py`)
+
+`run_step.py` re-runs any step (or several, in order) against an existing results folder, with whatever parameters you choose, no GUI required. When a run does not start at Step 1 it auto-loads the cache into memory first (the equivalent of the GUI's *Load Previous Data*); for the raw-video stages (Steps 1 through 2f) point it at the raw videos with `--input-dir`.
+
+```
+# Re-run a single step on one session
+python run_step.py 7f --results-dir /path/to/3334_17_Processed
+
+# Re-run several steps in order, and make QC plots afterwards
+python run_step.py 7e 7f 8a --results-dir /path/to/3334_17_Processed --qc
+
+# Re-derive the whole CNMF chain from the cached crop
+python run_step.py --from 3b --to 8c --results-dir /path/to/session
+
+# Override a parameter for this run only
+python run_step.py 6d --set sparse_penal=0.2 --set p=1 --results-dir /path/to/session
+
+# See every step id, or inspect one step's parameters
+python run_step.py --list
+python run_step.py --show 7f
+```
+
+Frequently used options:
+
+- **`steps`** / **`--all`** / **`--from STEP`** / **`--to STEP`** - which steps to run.
+- **`-r, --results-dir`** / **`--cache-path`** - the session to operate on.
+- **`--input-dir`** - raw-video directory, required for Steps 1-2f.
+- **`--set NAME=VALUE`** - override a step parameter (repeatable). Otherwise parameters come from the session's saved `processing_parameters.json`.
+- **`--qc`** - run the QC viewer after the step(s) finish.
+- **`--workers` / `--memory` / `--no-dask`** - Dask configuration; `--no-dask` runs inline.
+- **`--keep-going`** - continue to later steps even if one fails.
+- **`--list` / `--show STEP` / `--dry-run`** - inspect without running.
+- **`--log-file` / `--log-dir`** - a full transcript of the run is mirrored to a log file.
+
+On Windows you can use the `run_step.cmd` wrapper, and on Mac `run_step.command`, so you do not have to activate the bundled environment by hand.
+
+### Batch-processing many sessions (`run_multiple.py`)
+
+`run_multiple.py` runs `run_step.py` over many sessions, one at a time. Each session is launched as its **own subprocess** with a fresh Dask cluster, so a session that fails - even with a hard crash - is simply logged as a non-zero exit code and the batch moves on to the next one. Each session reads its own `processing_parameters.json`, so you do not pass scientific parameters here.
+
+```
+# Every *_Processed session under a folder, full pipeline each
+python run_multiple.py --root /path/to/BE_Processed_first_20
+
+# Explicit sessions, in this order
+python run_multiple.py /path/to/3334_17_Processed /path/to/3340_5_Processed
+
+# Re-derive the CNMF chain from cache instead of reprocessing from raw
+python run_multiple.py --root /path/to/BE_Processed_first_20 --run-args "--from 3b --to 8c --qc"
+```
+
+By default each session is run as `--all --no-dask --keep-going --qc`; change that with `--run-args` (do not put `--results-dir` there, it is added per session). Use `--log-dir` to choose where logs go and `--timeout-min` to skip a session that hangs. Two cross-session reports are written into the log folder and refreshed after every session:
+
+- **`failures.log`** - every failed step, with session, step, and error message.
+- **`component_counts_table.txt`** - all sessions × steps, with the component count in each cell.
+
+### Quality-control plots (`qc_cnmf.py`)
+
+`qc_cnmf.py` reads what a step already wrote - its spatial footprints (A) and, where they exist, its calcium traces (C) - and saves figures into `cache_data/qc_plots/`. It does **not** recompute anything.
+
+```
+python qc_cnmf.py 7f --results-dir /path/to/3334_17_Processed
+python qc_cnmf.py 4c 4d 4e 4f 4g --results-dir /path/to/session
+python qc_cnmf.py --all --root /path/to/BE_Processed_first_20
+python qc_cnmf.py --list
+```
+
+For each step it writes:
+
+- **`..._spatial.png`** - a coloured footprint map, one colour per neuron.
+- **`..._traces.png`** - the full-recording trace stack, in matching colours.
+- **`..._centroids.png`** - a centroid scatter, one dot per component (Step 4 substeps 4c-4g only).
+
+It also keeps a cumulative `component_counts.txt` recording how many components each QC'd step found - a quick way to see where in the pipeline your component count grew or shrank. Use the step id `4h` for the kept (artifact-rejected) set and `4hq` for the quarantine set. Passing `--qc` to `run_step.py` runs this viewer automatically after a step completes.
 
 ---
 
