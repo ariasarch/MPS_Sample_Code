@@ -773,12 +773,33 @@ Step 8 re-runs the temporal update using the improved spatial footprints from St
 
 #### Step 8c: Final Filtering and Data Export
 
-> **No parameter deep dive for this step.** See the Step 6e documentation for the filtering logic - the same criteria (min spike sum, min calcium variance, min spatial sum) apply. Export format is a practical choice based on your downstream analysis tools rather than a parameter to tune.
+Step 8c applies a final round of quality filtering, runs a footprint **merge-and-cleanup pass**, and exports the data. The filtering criteria mirror Step 6e and need no deep dive; the merge-and-cleanup pass has six tunable knobs and is documented below.
 
-**Filtering Criteria:**
+**Filtering Criteria** (same logic as Step 6e):
 - **Min Component Size**: Minimum size in pixels
 - **Min Signal-to-Noise Ratio**: Minimum SNR threshold
 - **Min Correlation**: Minimum correlation coefficient
+
+##### Final Merge & Cleanup
+
+After the filters above, Step 8c runs a `trim → clean → merge → cut` pass over the spatial footprints (enabled by default; uncheck **Enable final merge & cleanup** to skip it). It is the last chance to collapse duplicate components and tidy meshed or touching footprints before export, operating on the now-final spatial map. Four operations run in order:
+
+- **Trim** (fixed, not exposed) - zeroes each footprint's halo, keeping only pixels above 25% of that footprint's peak.
+- **Clean** - within each footprint, watershed-splits multi-peak blobs and then keeps the surviving blobs (controlled by `similarity_ratio` and `drop_min_px`).
+- **Merge** - re-runs the Step 7f duplicate merge on the cleaned set, fusing a pair only when it overlaps in space **and** correlates in time, subject to a size cap.
+- **Cut** - removes a thin "black wall" of pixels between adjacent cells so meshed footprints separate cleanly.
+
+**Parameters** (defaults shown):
+- **Similarity Ratio** (`similarity_ratio`, 0.30): In the clean step, a watershed blob survives only if its area is at least this fraction of the largest blob in that footprint. This is what stops watershed from over-splitting - small sub-blobs drop out. Lower keeps/splits more; higher drops more. A footprint always keeps at least its largest blob, so a component is never deleted outright here.
+- **Drop Min Pixels** (`drop_min_px`, 25): Absolute size floor for the clean step (≈ a 5×5 patch). Blobs below this are discarded, subject to the always-keep-the-largest rule above.
+- **Overlap Threshold** (`overlap_thr`, 0.30): The spatial gate for the merge - two cells must share at least this fraction of the smaller footprint (containment) before their traces are compared. This mirrors Step 7f's overlap criterion. Raise it if genuinely distinct neighbours are being fused.
+- **Correlation Threshold** (`corr_thr`, 0.70): The temporal gate for the merge - two spatially overlapping cells are fused only if their calcium traces correlate at least this strongly. A pair must clear *both* this and the overlap threshold, so adjacent-but-independent neurons are left alone. Raise to merge only near-identical traces; lower to merge more.
+- **Max Merge Size** (`max_size`, 5000): Safety cap on the merge - if fusing a group would exceed this many pixels, the merge is refused and the members stay separate. It does not delete large cells; it prevents runaway unions.
+- **Boundary Cut** (`dilate_px`, 2): Radius of the black-wall cut between touching cells. It never grows a footprint - it only removes pixels within this distance of an inter-cell interface, leaving a ~`2 × dilate_px`-wide gap. Set to 0 to disable.
+
+> **What changes on export:** Because this pass splits and merges components, the exported `unit_id`s are renumbered, and the spike trains (S) are reduced with the same grouping as the temporal traces (C) so A, C, and S stay aligned. If real neurons disappear after a run, loosen the thresholds (lower `similarity_ratio` and `corr_thr`); if duplicate or meshed cells persist, tighten them.
+
+> **Relationship to Step 7f:** The merge here uses the same overlap-and-correlation logic as Step 7f, run once more on the final footprints. Step 7f's correlation default is slightly stricter (0.8) than Step 8c's (0.70); for long recordings you can safely raise `corr_thr` here, following the same recording-length intuition described in Step 4g - a longer recording yields a higher-confidence correlation estimate, so a higher threshold stays safe.
 
 **Export Options:**
 - **Zarr format**: Efficient for large-scale analysis with chunked out-of-memory computation
